@@ -78,13 +78,19 @@ object Fs {
                     if (src.renameTo(dest)) {
                         ok++
                     } else if (src.copyRecursively(dest, overwrite = false)) {
+                        preserveTimes(src, dest)
                         src.deleteRecursively()
                         ok++
                     } else {
                         dest.deleteRecursively()
                     }
                 } else {
-                    if (src.copyRecursively(dest, overwrite = false)) ok++ else dest.deleteRecursively()
+                    if (src.copyRecursively(dest, overwrite = false)) {
+                        preserveTimes(src, dest)
+                        ok++
+                    } else {
+                        dest.deleteRecursively()
+                    }
                 }
             } catch (e: Exception) {
                 // Не удалось — убираем недокопированный остаток, оригинал не трогаем
@@ -92,6 +98,37 @@ object Fs {
             }
         }
         return ok
+    }
+
+    /** Копия файла получает ту же дату изменения, что и оригинал. */
+    private fun preserveTimes(src: File, dest: File) {
+        try {
+            if (src.isDirectory) src.listFiles()?.forEach { preserveTimes(it, File(dest, it.name)) }
+            dest.setLastModified(src.lastModified())
+        } catch (e: Exception) {
+            // дата не важна настолько, чтобы прерывать копирование
+        }
+    }
+
+    /** Все файлы нужного вида из всех вложенных папок, новые сверху. kind: 1 — фото, 2 — видео, 3 — остальное. */
+    fun listAll(root: File, kind: Int): List<File> {
+        val out = mutableListOf<File>()
+        fun walk(d: File) {
+            d.listFiles()?.forEach { f ->
+                if (f.isDirectory) {
+                    walk(f)
+                } else {
+                    val match = when (kind) {
+                        1 -> isImage(f)
+                        2 -> isVideo(f)
+                        else -> !isMedia(f)
+                    }
+                    if (match) out.add(f)
+                }
+            }
+        }
+        walk(root)
+        return out.sortedByDescending { it.lastModified() }
     }
 
     /** Разворачивает выбранные файлы и папки в список «относительный путь → файл». */

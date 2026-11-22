@@ -19,6 +19,8 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,6 +34,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
@@ -41,6 +46,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -267,6 +275,9 @@ fun ExplorerScreen(
     var showFtp by remember { mutableStateOf(false) }
     var showReceive by remember { mutableStateOf(false) }
     var sendItems by remember { mutableStateOf<List<File>?>(null) }
+    var vaultTab by remember { mutableIntStateOf(0) } // 0 — все, 1 — фото, 2 — видео, 3 — файлы
+    val viewPrefs = remember { ViewPrefs(ctx) }
+    var showViewDialog by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
     val loader = remember {
@@ -301,11 +312,31 @@ fun ExplorerScreen(
     LaunchedEffect(inVault) {
         viewer = null
         selected = emptySet()
-        if (!inVault) vaultDir = vaultRoot
+        if (!inVault) {
+            vaultDir = vaultRoot
+            vaultTab = 0
+        }
     }
 
-    val entries = remember(dir, refreshKey, byDate, showList) {
-        if (showList) Fs.list(dir, byDate) else emptyList()
+    val entries = remember(dir, refreshKey, byDate, showList, inVault, vaultTab) {
+        when {
+            !showList -> emptyList()
+            inVault && vaultTab != 0 -> Fs.listAll(vaultRoot, vaultTab)
+            else -> Fs.list(dir, byDate)
+        }
+    }
+
+    fun onItem(f: File) {
+        if (selected.isNotEmpty()) {
+            selected = if (f in selected) selected - f else selected + f
+        } else if (f.isDirectory) {
+            setDir(f)
+        } else if (Fs.isMedia(f)) {
+            val media = entries.filter { Fs.isMedia(it) }
+            viewer = Pair(media, media.indexOf(f))
+        } else {
+            toast("Этот тип файлов пока нельзя открыть")
+        }
     }
 
     LaunchedEffect(dir, inVault) { listState.scrollToItem(0) }
@@ -317,9 +348,10 @@ fun ExplorerScreen(
     }
 
     val mainVisible = !authVault && !showFtp && viewer == null
-    BackHandler(enabled = mainVisible && (selected.isNotEmpty() || dir != root || inVault)) {
+    BackHandler(enabled = mainVisible && (selected.isNotEmpty() || dir != root || inVault || vaultTab != 0)) {
         when {
             selected.isNotEmpty() -> selected = emptySet()
+            inVault && vaultTab != 0 -> vaultTab = 0
             dir != root -> dir.parentFile?.let { setDir(it) }
             inVault -> setInVault(false)
         }
@@ -364,7 +396,7 @@ fun ExplorerScreen(
                             TextButton(onClick = { menuOpen = true }) { Text("⋮", fontSize = 22.sp) }
                             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                                 if (selected.isEmpty()) {
-                                    if (showList) {
+                                    if (showList && (!inVault || vaultTab == 0)) {
                                         DropdownMenuItem(
                                             text = { Text("Новая папка") },
                                             onClick = { menuOpen = false; showNewFolder = true }
@@ -375,6 +407,18 @@ fun ExplorerScreen(
                                             },
                                             onClick = { menuOpen = false; byDate = !byDate }
                                         )
+                                        DropdownMenuItem(
+                                            text = { Text("Обновить") },
+                                            onClick = { menuOpen = false; refreshKey++ }
+                                        )
+                                    }
+                                    if (inVault && vaultTab != 0) {
+                                        if (vaultTab in 1..2) {
+                                            DropdownMenuItem(
+                                                text = { Text("Вид миниатюр") },
+                                                onClick = { menuOpen = false; showViewDialog = true }
+                                            )
+                                        }
                                         DropdownMenuItem(
                                             text = { Text("Обновить") },
                                             onClick = { menuOpen = false; refreshKey++ }
@@ -441,7 +485,7 @@ fun ExplorerScreen(
             },
             bottomBar = {
                 val c = clip
-                if (c != null && showList) {
+                if (c != null && showList && (!inVault || vaultTab == 0)) {
                     Surface(tonalElevation = 3.dp) {
                         Row(
                             Modifier
@@ -498,58 +542,73 @@ fun ExplorerScreen(
             ) {
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
 
+                if (inVault) {
+                    TabRow(selectedTabIndex = vaultTab) {
+                        listOf("Все", "Фото", "Видео", "Файлы").forEachIndexed { i, t ->
+                            Tab(
+                                selected = vaultTab == i,
+                                onClick = { vaultTab = i; selected = emptySet() },
+                                text = { Text(t) }
+                            )
+                        }
+                    }
+                }
+
                 if (!showList) {
                     PermissionPrompt(onRequestStorage)
                 } else {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        if (dir != root) {
-                            TextButton(onClick = { dir.parentFile?.let { setDir(it) } }) { Text("⬆") }
+                    val tabbed = inVault && vaultTab != 0
+                    if (!tabbed) {
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (dir != root) {
+                                TextButton(onClick = { dir.parentFile?.let { setDir(it) } }) { Text("⬆") }
+                            }
+                            Text(
+                                (if (inVault) "Хранилище" else "Память") + dir.path.removePrefix(root.path),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp)
+                            )
                         }
-                        Text(
-                            (if (inVault) "Хранилище" else "Память") + dir.path.removePrefix(root.path),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp)
-                        )
                     }
 
-                    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                        if (entries.isEmpty()) {
-                            item {
-                                Box(
-                                    Modifier.fillParentMaxSize(),
-                                    contentAlignment = Alignment.Center
-                                ) { Text("Папка пуста") }
-                            }
-                        } else {
-                            items(entries, key = { it.path }) { f ->
-                                FileRow(
-                                    f = f,
-                                    selected = f in selected,
-                                    stamp = refreshKey,
-                                    loader = loader,
-                                    dateFmt = dateFmt,
-                                    onClick = {
-                                        if (selected.isNotEmpty()) {
-                                            selected = if (f in selected) selected - f else selected + f
-                                        } else if (f.isDirectory) {
-                                            setDir(f)
-                                        } else if (Fs.isMedia(f)) {
-                                            val media = entries.filter { Fs.isMedia(it) }
-                                            viewer = Pair(media, media.indexOf(f))
-                                        } else {
-                                            toast("Этот тип файлов пока нельзя открыть")
-                                        }
-                                    },
-                                    onLongClick = { selected = selected + f }
-                                )
+                    if (tabbed && vaultTab in 1..2 && entries.isNotEmpty()) {
+                        MediaCollection(
+                            files = entries,
+                            prefs = viewPrefs,
+                            selected = selected,
+                            loader = loader,
+                            onClick = { onItem(it) },
+                            onLongClick = { selected = selected + it }
+                        )
+                    } else {
+                        LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                            if (entries.isEmpty()) {
+                                item {
+                                    Box(
+                                        Modifier.fillParentMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) { Text(if (tabbed) "Здесь пока ничего нет" else "Папка пуста") }
+                                }
+                            } else {
+                                items(entries, key = { it.path }) { f ->
+                                    FileRow(
+                                        f = f,
+                                        selected = f in selected,
+                                        stamp = refreshKey,
+                                        loader = loader,
+                                        dateFmt = dateFmt,
+                                        onClick = { onItem(f) },
+                                        onLongClick = { selected = selected + f }
+                                    )
+                                }
                             }
                         }
                     }
@@ -619,6 +678,10 @@ fun ExplorerScreen(
 
     if (showReceive) {
         ReceiveDialog(onDismiss = { showReceive = false })
+    }
+
+    if (showViewDialog) {
+        ViewDialog(prefs = viewPrefs, onDismiss = { showViewDialog = false })
     }
 }
 
@@ -1038,4 +1101,198 @@ fun VideoPage(file: File, isCurrent: Boolean) {
         },
         modifier = Modifier.fillMaxSize()
     )
+}
+
+// ───────────────────────── Вид миниатюр (фото и видео) ─────────────────────────
+
+class ViewPrefs(ctx: Context) {
+    private val p = ctx.getSharedPreferences("view_prefs", Context.MODE_PRIVATE)
+
+    // 0 — список, 1 — сетка по 4, 2 — сетка по 2, 3 — крупные на всю ширину
+    var mode by mutableIntStateOf(p.getInt("mode", 1))
+    var showName by mutableStateOf(p.getBoolean("name", true))
+    var showDate by mutableStateOf(p.getBoolean("date", false))
+
+    fun save() {
+        p.edit().putInt("mode", mode).putBoolean("name", showName).putBoolean("date", showDate).apply()
+    }
+}
+
+@Composable
+fun ViewDialog(prefs: ViewPrefs, onDismiss: () -> Unit) {
+    val labels = listOf(
+        "Список: миниатюра, название и дата в строку",
+        "Сетка, 4 в ряд",
+        "Сетка, 2 в ряд",
+        "Крупные, на всю ширину"
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Вид миниатюр") },
+        text = {
+            Column {
+                labels.forEachIndexed { i, label ->
+                    TextButton(onClick = { prefs.mode = i; prefs.save() }) {
+                        Text((if (prefs.mode == i) "● " else "○ ") + label)
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = prefs.showName,
+                        onCheckedChange = { prefs.showName = it; prefs.save() }
+                    )
+                    Text("Показывать название")
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = prefs.showDate,
+                        onCheckedChange = { prefs.showDate = it; prefs.save() }
+                    )
+                    Text("Показывать дату")
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Готово") } }
+    )
+}
+
+@Composable
+fun Thumb(f: File, loader: ImageLoader, selected: Boolean, modifier: Modifier, fit: Boolean = false) {
+    Box(modifier.background(Color(0xFF222222))) {
+        AsyncImage(
+            model = f,
+            imageLoader = loader,
+            contentDescription = null,
+            contentScale = if (fit) ContentScale.Fit else ContentScale.Crop,
+            modifier = Modifier.fillMaxSize()
+        )
+        if (Fs.isVideo(f)) {
+            Text("▶", color = Color.White, fontSize = 22.sp, modifier = Modifier.align(Alignment.Center))
+        }
+        if (selected) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color(0x886650A4)),
+                contentAlignment = Alignment.Center
+            ) { Text("✓", color = Color.White, fontSize = 28.sp) }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun MediaCollection(
+    files: List<File>,
+    prefs: ViewPrefs,
+    selected: Set<File>,
+    loader: ImageLoader,
+    onClick: (File) -> Unit,
+    onLongClick: (File) -> Unit
+) {
+    val fullFmt = remember { SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()) }
+    val shortFmt = remember { SimpleDateFormat("dd.MM.yy", Locale.getDefault()) }
+
+    when (prefs.mode) {
+        0 -> LazyColumn(Modifier.fillMaxSize()) {
+            items(files, key = { it.path }) { f ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(onClick = { onClick(f) }, onLongClick = { onLongClick(f) })
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Thumb(f, loader, f in selected, Modifier.size(64.dp))
+                    if (prefs.showName || prefs.showDate) {
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            if (prefs.showName) {
+                                Text(f.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            if (prefs.showDate) {
+                                Text(
+                                    fullFmt.format(Date(f.lastModified())),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        1, 2 -> LazyVerticalGrid(
+            columns = GridCells.Fixed(if (prefs.mode == 1) 4 else 2),
+            contentPadding = PaddingValues(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            gridItems(files, key = { it.path }) { f ->
+                Column(
+                    Modifier.combinedClickable(onClick = { onClick(f) }, onLongClick = { onLongClick(f) })
+                ) {
+                    Thumb(f, loader, f in selected, Modifier.fillMaxWidth().aspectRatio(1f))
+                    if (prefs.showName) {
+                        Text(
+                            f.name,
+                            fontSize = if (prefs.mode == 1) 10.sp else 13.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (prefs.showDate) {
+                        Text(
+                            (if (prefs.mode == 1) shortFmt else fullFmt).format(Date(f.lastModified())),
+                            fontSize = if (prefs.mode == 1) 9.sp else 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+        }
+
+        else -> LazyColumn(Modifier.fillMaxSize()) {
+            items(files, key = { it.path }) { f ->
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(onClick = { onClick(f) }, onLongClick = { onLongClick(f) })
+                        .padding(bottom = 12.dp)
+                ) {
+                    Thumb(f, loader, f in selected, Modifier.fillMaxWidth().aspectRatio(4f / 3f), fit = true)
+                    if (prefs.showName || prefs.showDate) {
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (prefs.showName) {
+                                Text(
+                                    f.name,
+                                    modifier = Modifier.weight(1f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            } else {
+                                Spacer(Modifier.weight(1f))
+                            }
+                            if (prefs.showDate) {
+                                Text(
+                                    fullFmt.format(Date(f.lastModified())),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
