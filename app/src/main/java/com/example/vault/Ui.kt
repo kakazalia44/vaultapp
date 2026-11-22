@@ -16,6 +16,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -62,11 +64,11 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.changedToUp
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -75,7 +77,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -236,7 +237,7 @@ fun VaultGate(onSuccess: () -> Unit, onCancel: () -> Unit) {
 
 // ───────────────────────── Проводник ─────────────────────────
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun ExplorerScreen(
     inVault: Boolean,
@@ -309,39 +310,10 @@ fun ExplorerScreen(
 
     LaunchedEffect(dir, inVault) { listState.scrollToItem(0) }
 
-    // Скрытый вход: в корне памяти потянуть список вверх до упора и ещё немного
-    val pullPx = with(LocalDensity.current) { 220.dp.toPx() }
+    // Скрытый вход: в обычном разделе потянуть список вверх, когда он уже доехал до конца
+    val pullPx = with(LocalDensity.current) { 110.dp.toPx() }
     val onPull by rememberUpdatedState {
-        if (!inVault && phoneDir == phoneRoot && selected.isEmpty() && !authVault) authVault = true
-    }
-    val pull = remember(pullPx) {
-        object : NestedScrollConnection {
-            private var acc = 0f
-
-            override fun onPostScroll(
-                consumed: Offset,
-                available: Offset,
-                source: NestedScrollSource
-            ): Offset {
-                if (source == NestedScrollSource.UserInput) {
-                    if (available.y < 0f) {
-                        acc -= available.y
-                        if (acc > pullPx) {
-                            acc = 0f
-                            onPull()
-                        }
-                    } else if (available.y > 0f) {
-                        acc = 0f
-                    }
-                }
-                return Offset.Zero
-            }
-
-            override suspend fun onPreFling(available: Velocity): Velocity {
-                acc = 0f
-                return Velocity.Zero
-            }
-        }
+        if (!inVault && selected.isEmpty() && !authVault) authVault = true
     }
 
     val mainVisible = !authVault && !showFtp && viewer == null
@@ -378,7 +350,13 @@ fun ExplorerScreen(
                                 else -> dir.name
                             },
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.combinedClickable(
+                                onClick = {},
+                                onLongClick = {
+                                    if (!inVault && selected.isEmpty()) authVault = true
+                                }
+                            )
                         )
                     },
                     actions = {
@@ -499,7 +477,24 @@ fun ExplorerScreen(
                 Modifier
                     .padding(padding)
                     .fillMaxSize()
-                    .nestedScroll(pull)
+                    .pointerInput(pullPx, showList) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            val atEnd = !showList || !listState.canScrollForward
+                            var dy = 0f
+                            var fired = false
+                            while (atEnd) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val c = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (!c.pressed) break
+                                dy += c.positionChange().y
+                                if (!fired && -dy > pullPx) {
+                                    fired = true
+                                    onPull()
+                                }
+                            }
+                        }
+                    }
             ) {
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
 
