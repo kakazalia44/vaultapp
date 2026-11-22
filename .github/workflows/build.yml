@@ -2,7 +2,11 @@ name: Build APK
 
 on:
   push:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -22,9 +26,15 @@ jobs:
       - name: Build debug APK
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          gradle assembleDebug --no-daemon
+          gradle assembleDebug --no-daemon -PbuildNumber=${{ github.run_number }}
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: vault-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="0.1.${{ github.run_number }}"
+          cp app/build/outputs/apk/debug/app-debug.apk "vault-$VERSION.apk"
+          gh release create "v$VERSION" "vault-$VERSION.apk" \
+            --title "Версия $VERSION" \
+            --notes "Сборка №${{ github.run_number }}" \
+            --target "${{ github.sha }}"

@@ -12,8 +12,10 @@ android {
         applicationId = "com.example.vault"
         minSdk = 30
         targetSdk = 35
-        versionCode = 2
-        versionName = "2.0"
+        // Номер сборки приходит с GitHub (-PbuildNumber=N); локально — 1
+        val build = (project.findProperty("buildNumber") as String?)?.toIntOrNull() ?: 1
+        versionCode = build
+        versionName = "0.1.$build"
     }
 
     buildTypes {
