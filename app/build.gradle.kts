@@ -18,9 +18,23 @@ android {
         versionName = "0.1.$build"
     }
 
+    // Постоянный ключ подписи: файл и пароль подставляет сборка на GitHub из секретов
+    val ksFile = file("release.keystore")
+    signingConfigs {
+        create("release") {
+            if (ksFile.exists()) {
+                storeFile = ksFile
+                storePassword = System.getenv("KEY_PASSWORD")
+                keyAlias = "provodnik"
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (ksFile.exists()) signingConfig = signingConfigs.getByName("release")
         }
     }
 
