@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -18,6 +19,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
@@ -64,6 +68,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -72,12 +77,15 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -85,16 +93,19 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.decode.VideoFrameDecoder
+import coil.request.ImageRequest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -1030,11 +1041,27 @@ fun ReceiveDialog(onDismiss: () -> Unit) {
 
 // ───────────────────────── Просмотр фото и видео ─────────────────────────
 
+private val orientationNames = listOf("Авто", "Альбомная", "Книжная")
+private val orientationValues = listOf(
+    ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED,
+    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE,
+    ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun Viewer(files: List<File>, start: Int, loader: ImageLoader, onClose: () -> Unit) {
+    val activity = LocalContext.current.findActivity()
     val pagerState = rememberPagerState(initialPage = start.coerceIn(0, files.lastIndex)) {
         files.size
+    }
+    var zoomed by remember { mutableStateOf(false) }
+    var orient by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(pagerState.currentPage) { zoomed = false }
+    LaunchedEffect(orient) { activity?.requestedOrientation = orientationValues[orient] }
+    DisposableEffect(Unit) {
+        onDispose { activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
     }
 
     Column(
@@ -1046,6 +1073,9 @@ fun Viewer(files: List<File>, start: Int, loader: ImageLoader, onClose: () -> Un
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             TextButton(onClick = onClose) { Text("← Назад") }
             Spacer(Modifier.weight(1f))
+            TextButton(onClick = { orient = (orient + 1) % orientationValues.size }) {
+                Text("⟳ " + orientationNames[orient])
+            }
             Text(
                 "${pagerState.currentPage + 1} / ${files.size}",
                 color = Color.White,
@@ -1054,6 +1084,7 @@ fun Viewer(files: List<File>, start: Int, loader: ImageLoader, onClose: () -> Un
         }
         HorizontalPager(
             state = pagerState,
+            userScrollEnabled = !zoomed,
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
@@ -1062,16 +1093,71 @@ fun Viewer(files: List<File>, start: Int, loader: ImageLoader, onClose: () -> Un
             if (Fs.isVideo(f)) {
                 VideoPage(file = f, isCurrent = pagerState.currentPage == page)
             } else {
-                AsyncImage(
-                    model = f,
-                    imageLoader = loader,
-                    contentDescription = null,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize()
-                )
+                ZoomableImage(file = f, loader = loader) { z ->
+                    if (pagerState.currentPage == page) zoomed = z
+                }
             }
         }
     }
+}
+
+/** Фото: увеличение щипком, двойное касание — приблизить или вернуть, перемещение пальцем при увеличении. */
+@Composable
+fun ZoomableImage(file: File, loader: ImageLoader, onZoomChange: (Boolean) -> Unit) {
+    val ctx = LocalContext.current
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    var size by remember { mutableStateOf(IntSize.Zero) }
+
+    fun clamp(o: Offset, sc: Float): Offset {
+        val mx = size.width * (sc - 1f) / 2f
+        val my = size.height * (sc - 1f) / 2f
+        return Offset(o.x.coerceIn(-mx, mx), o.y.coerceIn(-my, my))
+    }
+
+    val state = rememberTransformableState { zoomChange, panChange, _ ->
+        val ns = (scale * zoomChange).coerceIn(1f, 6f)
+        scale = ns
+        offset = if (ns <= 1f) Offset.Zero else clamp(offset + panChange, ns)
+    }
+
+    LaunchedEffect(scale > 1.01f) { onZoomChange(scale > 1.01f) }
+
+    val request = remember(file) {
+        ImageRequest.Builder(ctx).data(file).size(2400).build()
+    }
+
+    AsyncImage(
+        model = request,
+        imageLoader = loader,
+        contentDescription = null,
+        contentScale = ContentScale.Fit,
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged { size = it }
+            .pointerInput(Unit) {
+                detectTapGestures(onDoubleTap = {
+                    if (scale > 1.01f) {
+                        scale = 1f
+                        offset = Offset.Zero
+                    } else {
+                        scale = 2.5f
+                    }
+                })
+            }
+            .transformable(state = state, canPan = { scale > 1.01f })
+            .graphicsLayer(
+                scaleX = scale,
+                scaleY = scale,
+                translationX = offset.x,
+                translationY = offset.y
+            )
+    )
+}
+
+private fun formatTime(ms: Long): String {
+    val total = ms / 1000
+    return String.format(Locale.US, "%d:%02d", total / 60, total % 60)
 }
 
 @Composable
@@ -1084,23 +1170,80 @@ fun VideoPage(file: File, isCurrent: Boolean) {
         }
     }
 
+    var loopAll by remember { mutableStateOf(false) }
+    var speedIndex by remember { mutableIntStateOf(1) }
+    var pointA by remember { mutableStateOf<Long?>(null) }
+    var pointB by remember { mutableStateOf<Long?>(null) }
+    val speeds = remember { listOf(0.5f, 1f, 1.5f, 2f) }
+
     LaunchedEffect(isCurrent) {
         if (isCurrent) exo.play() else exo.pause()
+    }
+    LaunchedEffect(loopAll) {
+        exo.repeatMode = if (loopAll) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+    }
+    LaunchedEffect(speedIndex) { exo.setPlaybackSpeed(speeds[speedIndex]) }
+
+    // Повтор отрезка: дошли до B — возвращаемся в A
+    LaunchedEffect(pointA, pointB) {
+        val a = pointA
+        val b = pointB
+        if (a != null && b != null) {
+            while (true) {
+                if (exo.isPlaying && exo.currentPosition >= b) exo.seekTo(a)
+                delay(50)
+            }
+        }
     }
 
     DisposableEffect(exo) {
         onDispose { exo.release() }
     }
 
-    AndroidView(
-        factory = { context ->
-            PlayerView(context).apply {
-                player = exo
-                useController = true
+    Box(Modifier.fillMaxSize()) {
+        AndroidView(
+            factory = { context ->
+                PlayerView(context).apply {
+                    player = exo
+                    useController = true
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+        Row(
+            Modifier
+                .align(Alignment.TopCenter)
+                .background(Color(0x66000000)),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TextButton(onClick = { loopAll = !loopAll }) {
+                Text(if (loopAll) "↻ Повтор ✓" else "↻ Повтор", fontSize = 13.sp)
             }
-        },
-        modifier = Modifier.fillMaxSize()
-    )
+            TextButton(onClick = { speedIndex = (speedIndex + 1) % speeds.size }) {
+                Text("×" + speeds[speedIndex].toString().removeSuffix(".0"), fontSize = 13.sp)
+            }
+            TextButton(onClick = {
+                val pos = exo.currentPosition
+                pointA = pos
+                val b = pointB
+                if (b != null && b <= pos) pointB = null
+            }) {
+                Text(pointA?.let { "A " + formatTime(it) } ?: "A", fontSize = 13.sp)
+            }
+            TextButton(onClick = {
+                val pos = exo.currentPosition
+                val a = pointA
+                if (a == null || pos > a) pointB = pos
+            }) {
+                Text(pointB?.let { "B " + formatTime(it) } ?: "B", fontSize = 13.sp)
+            }
+            if (pointA != null || pointB != null) {
+                TextButton(onClick = { pointA = null; pointB = null }) {
+                    Text("Сброс", fontSize = 13.sp)
+                }
+            }
+        }
+    }
 }
 
 // ───────────────────────── Вид миниатюр (фото и видео) ─────────────────────────
