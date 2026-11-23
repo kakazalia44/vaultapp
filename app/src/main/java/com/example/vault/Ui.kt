@@ -1102,6 +1102,7 @@ fun Viewer(files: List<File>, start: Int, loader: ImageLoader, onClose: () -> Un
 }
 
 /** Фото: увеличение щипком, двойное касание — приблизить или вернуть, перемещение пальцем при увеличении. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ZoomableImage(file: File, loader: ImageLoader, onZoomChange: (Boolean) -> Unit) {
     val ctx = LocalContext.current
