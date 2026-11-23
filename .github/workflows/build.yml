@@ -33,6 +33,9 @@ jobs:
           fi
           echo "$KEYSTORE_B64" | base64 -d > app/release.keystore
 
+      - name: Run tests
+        run: gradle testReleaseUnitTest --no-daemon
+
       - name: Build signed release APK
         env:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
