@@ -58,6 +58,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         FtpState.load(this)
+        VaultCrypto.init(this)
 
         setContent {
             MaterialTheme(colorScheme = whiteDarkScheme) {
@@ -81,7 +82,10 @@ class MainActivity : ComponentActivity() {
     // Свернули приложение — скрытый раздел закрывается
     override fun onStop() {
         super.onStop()
-        if (!isChangingConfigurations) vaultOpen = false
+        if (!isChangingConfigurations) {
+            vaultOpen = false
+            VaultCrypto.lock()
+        }
     }
 
     private fun openStorageSettings() {

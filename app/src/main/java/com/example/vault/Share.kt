@@ -115,7 +115,7 @@ object Share {
         onProgress: (String) -> Unit
     ) {
         withContext(Dispatchers.IO) {
-            val total = items.sumOf { it.second.length() }.coerceAtLeast(1L)
+            val total = items.sumOf { Fs.sizeOf(it.second) }.coerceAtLeast(1L)
             var sent = 0L
             Socket().use { sock ->
                 sock.connect(InetSocketAddress(host, PORT), 5000)
@@ -134,11 +134,11 @@ object Share {
                 for ((index, item) in items.withIndex()) {
                     val rel = item.first
                     val f = item.second
-                    val len = f.length()
+                    val len = Fs.sizeOf(f)
                     out.writeUTF(rel)
                     out.writeLong(len)
                     var left = len
-                    FileInputStream(f).use { ins ->
+                    Fs.openInput(f).use { ins ->
                         while (left > 0) {
                             coroutineContext.ensureActive()
                             val n = ins.read(buf, 0, minOf(buf.size.toLong(), left).toInt())

@@ -4,6 +4,9 @@ import android.content.Context
 import android.util.Base64
 import android.webkit.MimeTypeMap
 import java.io.File
+import java.io.FileInputStream
+import java.io.IOException
+import java.io.InputStream
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Locale
@@ -59,9 +62,38 @@ object Fs {
         }
     }
 
-    /** Копирует или перемещает файлы и папки в destDir. Возвращает, сколько элементов обработано. */
+    /** Размер для показа: у зашифрованных файлов хранилища — размер самих данных. */
+    fun sizeOf(f: File): Long =
+        if (VaultCrypto.isVaultPath(f) && VaultCrypto.isEncrypted(f)) VaultCrypto.plainLength(f) else f.length()
+
+    /** Открывает файл для чтения; файлы хранилища расшифровываются. */
+    fun openInput(f: File): InputStream =
+        if (VaultCrypto.isVaultPath(f)) VaultCrypto.openStream(f) else FileInputStream(f)
+
+    /** Что отдавать загрузчику картинок: файлы хранилища — через расшифровку. */
+    fun imageModel(f: File): Any = if (VaultCrypto.isVaultPath(f)) VaultModel(f) else f
+
+    private fun copyTree(src: File, dest: File, srcVault: Boolean, destVault: Boolean) {
+        if (src.isDirectory) {
+            if (!dest.mkdirs() && !dest.isDirectory) throw IOException("не удалось создать папку")
+            src.listFiles()?.forEach { copyTree(it, File(dest, it.name), srcVault, destVault) }
+        } else {
+            when {
+                !srcVault && destVault -> VaultCrypto.encryptFile(src, dest)
+                srcVault && !destVault -> VaultCrypto.decryptFile(src, dest)
+                else -> src.copyTo(dest, overwrite = false)
+            }
+        }
+        dest.setLastModified(src.lastModified())
+    }
+
+    /**
+     * Копирует или перемещает файлы и папки в destDir. При переносе в хранилище файлы шифруются,
+     * при переносе из хранилища расшифровываются. Возвращает, сколько элементов обработано.
+     */
     fun paste(items: List<File>, move: Boolean, destDir: File): Int {
         var ok = 0
+        val destVault = VaultCrypto.isVaultPath(destDir)
         for (src in items) {
             var dest: File? = null
             try {
@@ -73,24 +105,23 @@ object Fs {
                 // Перемещение в ту же папку ничего не делает
                 if (move && src.parentFile?.path == destDir.path) continue
 
-                dest = uniqueDest(destDir, src.name)
+                val srcVault = VaultCrypto.isVaultPath(src)
+                val cross = srcVault != destVault
+                if (cross && !VaultCrypto.unlocked) throw IOException("Хранилище закрыто")
+
+                val target = uniqueDest(destDir, src.name)
+                dest = target
                 if (move) {
-                    if (src.renameTo(dest)) {
+                    if (!cross && src.renameTo(target)) {
                         ok++
-                    } else if (src.copyRecursively(dest, overwrite = false)) {
-                        preserveTimes(src, dest)
+                    } else {
+                        copyTree(src, target, srcVault, destVault)
                         src.deleteRecursively()
                         ok++
-                    } else {
-                        dest.deleteRecursively()
                     }
                 } else {
-                    if (src.copyRecursively(dest, overwrite = false)) {
-                        preserveTimes(src, dest)
-                        ok++
-                    } else {
-                        dest.deleteRecursively()
-                    }
+                    copyTree(src, target, srcVault, destVault)
+                    ok++
                 }
             } catch (e: Exception) {
                 // Не удалось — убираем недокопированный остаток, оригинал не трогаем
@@ -98,16 +129,6 @@ object Fs {
             }
         }
         return ok
-    }
-
-    /** Копия файла получает ту же дату изменения, что и оригинал. */
-    private fun preserveTimes(src: File, dest: File) {
-        try {
-            if (src.isDirectory) src.listFiles()?.forEach { preserveTimes(it, File(dest, it.name)) }
-            dest.setLastModified(src.lastModified())
-        } catch (e: Exception) {
-            // дата не важна настолько, чтобы прерывать копирование
-        }
     }
 
     /** Все файлы нужного вида из всех вложенных папок, новые сверху. kind: 1 — фото, 2 — видео, 3 — остальное. */

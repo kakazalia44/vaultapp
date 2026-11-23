@@ -100,6 +100,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSource
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import coil.ImageLoader
@@ -191,8 +194,10 @@ fun PinEntry(
 @Composable
 fun VaultGate(onSuccess: () -> Unit, onCancel: () -> Unit) {
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     val pins = remember { PinStore(ctx) }
     var hasPin by remember { mutableStateOf(pins.isSet()) }
+    var working by remember { mutableStateOf(false) }
 
     BackHandler(onBack = onCancel)
 
@@ -204,6 +209,7 @@ fun VaultGate(onSuccess: () -> Unit, onCancel: () -> Unit) {
             hint = if (first == null) "От 4 до 8 цифр. Восстановить его нельзя — не забудьте." else null,
             error = error,
             button = if (first == null) "Далее" else "Готово",
+            enabled = !working,
             onCancel = onCancel
         ) { pin ->
             val f = first
@@ -213,9 +219,21 @@ fun VaultGate(onSuccess: () -> Unit, onCancel: () -> Unit) {
                     error = null
                 }
                 f == pin -> {
-                    pins.save(pin)
-                    hasPin = true
-                    onSuccess()
+                    working = true
+                    scope.launch {
+                        val ok = withContext(Dispatchers.IO) {
+                            pins.save(pin)
+                            VaultCrypto.unlock(ctx, pin)
+                        }
+                        working = false
+                        if (ok) {
+                            hasPin = true
+                            onSuccess()
+                        } else {
+                            first = null
+                            error = "Не удалось создать ключ шифрования"
+                        }
+                    }
                 }
                 else -> {
                     first = null
@@ -240,15 +258,26 @@ fun VaultGate(onSuccess: () -> Unit, onCancel: () -> Unit) {
             hint = null,
             error = if (lockLeft > 0) "Слишком много попыток. Подождите $lockLeft с" else error,
             button = "Войти",
-            enabled = lockLeft == 0,
+            enabled = lockLeft == 0 && !working,
             onCancel = onCancel
         ) { pin ->
-            if (pins.check(pin)) {
-                onSuccess()
-            } else {
-                fails += 1
-                error = "Неверный PIN"
-                if (fails % 5 == 0) lockLeft = 30
+            working = true
+            scope.launch {
+                val pinOk = withContext(Dispatchers.IO) { pins.check(pin) }
+                if (pinOk) {
+                    val keyOk = withContext(Dispatchers.IO) { VaultCrypto.unlock(ctx, pin) }
+                    working = false
+                    if (keyOk) {
+                        onSuccess()
+                    } else {
+                        error = "Не удалось открыть ключ шифрования"
+                    }
+                } else {
+                    working = false
+                    fails += 1
+                    error = "Неверный PIN"
+                    if (fails % 5 == 0) lockLeft = 30
+                }
             }
         }
     }
@@ -289,11 +318,16 @@ fun ExplorerScreen(
     var vaultTab by remember { mutableIntStateOf(0) } // 0 — все, 1 — фото, 2 — видео, 3 — файлы
     val viewPrefs = remember { ViewPrefs(ctx) }
     var showViewDialog by remember { mutableStateOf(false) }
+    var migrating by remember { mutableStateOf<String?>(null) }
 
     val listState = rememberLazyListState()
     val loader = remember {
         ImageLoader.Builder(ctx)
-            .components { add(VideoFrameDecoder.Factory()) }
+            .components {
+                add(VaultKeyer())
+                add(VaultFetcherFactory())
+                add(VideoFrameDecoder.Factory())
+            }
             .build()
     }
     val dateFmt = remember { SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()) }
@@ -317,6 +351,15 @@ fun ExplorerScreen(
     DisposableEffect(secure) {
         if (secure) activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         onDispose { activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) }
+    }
+
+    // Хранилище закрылось (приложение свернули): забываем буфер с его файлами и кэш миниатюр
+    val vaultUnlocked = VaultCrypto.unlocked
+    LaunchedEffect(vaultUnlocked) {
+        if (!vaultUnlocked) {
+            clip = clip?.takeIf { c -> c.files.none { VaultCrypto.isVaultPath(it) } }
+            loader.memoryCache?.clear()
+        }
     }
 
     // При входе в скрытый раздел и выходе из него сбрасываем выбор и просмотр
@@ -372,8 +415,22 @@ fun ExplorerScreen(
     when {
         authVault -> VaultGate(
             onSuccess = {
-                authVault = false
-                setInVault(true)
+                scope.launch {
+                    val need = withContext(Dispatchers.IO) { VaultCrypto.needsMigration() }
+                    if (need) {
+                        migrating = "Шифрование файлов…"
+                        try {
+                            withContext(Dispatchers.IO) {
+                                VaultCrypto.migrate { d, t -> migrating = "Шифрование файлов: $d из $t" }
+                            }
+                        } catch (e: Exception) {
+                            toast("Не все файлы удалось зашифровать: " + (e.message ?: ""))
+                        }
+                        migrating = null
+                    }
+                    authVault = false
+                    setInVault(true)
+                }
             },
             onCancel = { authVault = false }
         )
@@ -511,15 +568,21 @@ fun ExplorerScreen(
                             )
                             TextButton(onClick = {
                                 val target = dir
-                                busy = true
-                                scope.launch {
-                                    val n = withContext(Dispatchers.IO) {
-                                        Fs.paste(c.files, c.move, target)
+                                val targetVault = VaultCrypto.isVaultPath(target)
+                                val cross = c.files.any { VaultCrypto.isVaultPath(it) != targetVault }
+                                if (cross && !VaultCrypto.unlocked) {
+                                    toast("Сначала откройте хранилище")
+                                } else {
+                                    busy = true
+                                    scope.launch {
+                                        val n = withContext(Dispatchers.IO) {
+                                            Fs.paste(c.files, c.move, target)
+                                        }
+                                        busy = false
+                                        refreshKey++
+                                        if (c.move) clip = null
+                                        toast("Готово: $n из ${c.files.size}")
                                     }
-                                    busy = false
-                                    refreshKey++
-                                    if (c.move) clip = null
-                                    toast("Готово: $n из ${c.files.size}")
                                 }
                             }) { Text("Вставить сюда") }
                             TextButton(onClick = { clip = null }) { Text("✕") }
@@ -691,6 +754,17 @@ fun ExplorerScreen(
         ReceiveDialog(onDismiss = { showReceive = false })
     }
 
+    val mg = migrating
+    if (mg != null) {
+        KeepScreenOn()
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Подождите") },
+            text = { Text(mg) },
+            confirmButton = {}
+        )
+    }
+
     if (showViewDialog) {
         ViewDialog(prefs = viewPrefs, onDismiss = { showViewDialog = false })
     }
@@ -754,7 +828,7 @@ fun FileRow(
         if (f.isDirectory) {
             "Папка · ${f.list()?.size ?: 0}"
         } else {
-            "${Fs.formatSize(f.length())} · ${dateFmt.format(Date(f.lastModified()))}"
+            "${Fs.formatSize(Fs.sizeOf(f))} · ${dateFmt.format(Date(f.lastModified()))}"
         }
     }
 
@@ -771,7 +845,7 @@ fun FileRow(
                 f.isDirectory -> Text("📁", fontSize = 28.sp)
                 Fs.isMedia(f) -> {
                     AsyncImage(
-                        model = f,
+                        model = Fs.imageModel(f),
                         imageLoader = loader,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
@@ -1125,7 +1199,7 @@ fun ZoomableImage(file: File, loader: ImageLoader, onZoomChange: (Boolean) -> Un
     LaunchedEffect(scale > 1.01f) { onZoomChange(scale > 1.01f) }
 
     val request = remember(file) {
-        ImageRequest.Builder(ctx).data(file).size(2400).build()
+        ImageRequest.Builder(ctx).data(Fs.imageModel(file)).size(2400).build()
     }
 
     AsyncImage(
@@ -1161,11 +1235,19 @@ private fun formatTime(ms: Long): String {
     return String.format(Locale.US, "%d:%02d", total / 60, total % 60)
 }
 
+@OptIn(UnstableApi::class)
 @Composable
 fun VideoPage(file: File, isCurrent: Boolean) {
     val ctx = LocalContext.current
     val exo = remember(file) {
-        ExoPlayer.Builder(ctx).build().apply {
+        val builder = ExoPlayer.Builder(ctx)
+        if (VaultCrypto.isVaultPath(file)) {
+            // файлы хранилища расшифровываются на лету, только в памяти
+            builder.setMediaSourceFactory(
+                DefaultMediaSourceFactory(DataSource.Factory { VaultDataSource() })
+            )
+        }
+        builder.build().apply {
             setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
             prepare()
         }
@@ -1305,7 +1387,7 @@ fun ViewDialog(prefs: ViewPrefs, onDismiss: () -> Unit) {
 fun Thumb(f: File, loader: ImageLoader, selected: Boolean, modifier: Modifier, fit: Boolean = false) {
     Box(modifier.background(Color(0xFF222222))) {
         AsyncImage(
-            model = f,
+            model = Fs.imageModel(f),
             imageLoader = loader,
             contentDescription = null,
             contentScale = if (fit) ContentScale.Fit else ContentScale.Crop,
