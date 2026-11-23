@@ -393,7 +393,7 @@ fun ExplorerScreen(
                     },
                     actions = {
                         Box {
-                            TextButton(onClick = { menuOpen = true }) { Text("⋮", fontSize = 22.sp) }
+                            TextButton(onClick = { menuOpen = true }) { Text("☰", fontSize = 22.sp) }
                             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                                 if (selected.isEmpty()) {
                                     if (showList && (!inVault || vaultTab == 0)) {
@@ -750,7 +750,7 @@ fun FileRow(
     Row(
         Modifier
             .fillMaxWidth()
-            .background(if (selected) Color(0x556650A4) else Color.Transparent)
+            .background(if (selected) Color(0x33FFFFFF) else Color.Transparent)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -1174,9 +1174,9 @@ fun Thumb(f: File, loader: ImageLoader, selected: Boolean, modifier: Modifier, f
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(Color(0x886650A4)),
+                    .background(Color(0x66FFFFFF)),
                 contentAlignment = Alignment.Center
-            ) { Text("✓", color = Color.White, fontSize = 28.sp) }
+            ) { Text("✓", color = Color.Black, fontSize = 28.sp) }
         }
     }
 }
