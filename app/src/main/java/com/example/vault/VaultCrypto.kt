@@ -194,7 +194,17 @@ object VaultCrypto {
         val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
         val header = ByteBuffer.allocate(HEADER).put(MAGIC).put(salt).putLong(length).array()
         out.write(header)
-        val key = fileKey(m, salt)
+        encryptChunks(fileKey(m, salt), header, input, length, out)
+    }
+
+    /** Шифрует данные блоками по 64 КБ (AES-GCM, номер блока в nonce, заголовок в проверке подлинности). */
+    internal fun encryptChunks(
+        key: SecretKeySpec,
+        header: ByteArray,
+        input: InputStream,
+        length: Long,
+        out: OutputStream
+    ) {
         val buf = ByteArray(CHUNK)
         var index = 0L
         var left = length
@@ -328,7 +338,8 @@ class VaultReader internal constructor(
     private val raf: RandomAccessFile,
     private val header: ByteArray,
     val plainLen: Long,
-    private val key: SecretKeySpec
+    private val key: SecretKeySpec,
+    private val dataOffset: Int = VaultCrypto.HEADER
 ) : Closeable {
 
     private var cachedIdx = -1L
@@ -357,7 +368,7 @@ class VaultReader internal constructor(
         val start = idx * VaultCrypto.CHUNK
         val plainThis = minOf(VaultCrypto.CHUNK.toLong(), plainLen - start).toInt()
         val enc = ByteArray(plainThis + VaultCrypto.TAG)
-        raf.seek(VaultCrypto.HEADER + idx * (VaultCrypto.CHUNK + VaultCrypto.TAG))
+        raf.seek(dataOffset + idx * (VaultCrypto.CHUNK + VaultCrypto.TAG))
         raf.readFully(enc)
         val c = Cipher.getInstance("AES/GCM/NoPadding")
         c.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, VaultCrypto.nonce(idx)))

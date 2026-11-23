@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Открыть контейнер</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: #121212; color: #ededed; }
+  main { max-width: 900px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  .card { background: #1e1e1e; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  label { display: block; margin: 8px 0 4px; color: #bdbdbd; }
+  input[type=password], input[type=text] { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #444; background: #121212; color: #fff; font-size: 15px; }
+  input[type=file] { width: 100%; }
+  button { padding: 9px 14px; border: 0; border-radius: 8px; background: #fff; color: #000; font-size: 14px; cursor: pointer; }
+  button.small { padding: 5px 10px; font-size: 13px; background: #3a3a3a; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 10px; min-height: 1.4em; }
+  .err { color: #ff8a80; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 7px 4px; border-bottom: 1px solid #2c2c2c; vertical-align: middle; word-break: break-word; }
+  td.num { white-space: nowrap; color: #bdbdbd; font-size: 13px; }
+  td.act { white-space: nowrap; text-align: right; }
+  #preview { text-align: center; }
+  #preview img, #preview video { max-width: 100%; max-height: 70vh; }
+  .hint { color: #bdbdbd; font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Открыть контейнер</h1>
+  <div class="card">
+    <label for="file">Файл контейнера</label>
+    <input id="file" type="file">
+    <label for="pw">Пароль</label>
+    <input id="pw" type="password" autocomplete="off">
+    <p><button id="open">Открыть</button></p>
+    <div id="status"></div>
+    <p class="hint">Всё происходит в вашем браузере: файл и пароль никуда не отправляются, интернет не нужен.</p>
+  </div>
+  <div class="card" id="listCard" hidden>
+    <input id="filter" type="text" placeholder="Поиск по названию">
+    <table id="list"></table>
+  </div>
+  <div class="card" id="previewCard" hidden>
+    <div id="preview"></div>
+  </div>
+</main>
+<script>
+const CHUNK = 65536, TAG = 16, HDR = 36;
+const MAGIC = 'PRVCNT01';
+
+function nonce(i) {
+  const n = new Uint8Array(12);
+  new DataView(n.buffer).setBigUint64(4, BigInt(i));
+  return n;
+}
+
+async function deriveKey(password, salt, iter) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: salt, iterations: iter }, base, 256);
+  return crypto.subtle.importKey('raw', bits, 'AES-GCM', false, ['decrypt']);
+}
+
+class Box {
+  constructor(blob, key, header, plainLen) {
+    this.blob = blob; this.key = key; this.header = header; this.plainLen = plainLen;
+    this.cacheIdx = -1; this.cache = null;
+  }
+  async chunk(i) {
+    if (i === this.cacheIdx) return this.cache;
+    const start = i * CHUNK;
+    const plainThis = Math.min(CHUNK, this.plainLen - start);
+    const off = HDR + i * (CHUNK + TAG);
+    const enc = await this.blob.slice(off, off + plainThis + TAG).arrayBuffer();
+    const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce(i), additionalData: this.header }, this.key, enc);
+    this.cache = new Uint8Array(dec);
+    this.cacheIdx = i;
+    return this.cache;
+  }
+  async read(pos, len) {
+    const out = new Uint8Array(len);
+    let done = 0;
+    while (done < len) {
+      const p = pos + done;
+      const i = Math.floor(p / CHUNK);
+      const c = await this.chunk(i);
+      const inC = p - i * CHUNK;
+      const n = Math.min(len - done, c.length - inC);
+      if (n <= 0) throw new Error('Файл повреждён');
+      out.set(c.subarray(inC, inC + n), done);
+      done += n;
+    }
+    return out;
+  }
+}
+
+async function openBox(blob, password) {
+  const head = new Uint8Array(await blob.slice(0, HDR).arrayBuffer());
+  if (head.length < HDR || new TextDecoder().decode(head.subarray(0, 8)) !== MAGIC) {
+    throw new Error('Это не контейнер или файл повреждён');
+  }
+  const dv = new DataView(head.buffer, head.byteOffset, head.length);
+  const iter = dv.getUint32(24);
+  const plainLen = Number(dv.getBigUint64(28));
+  if (iter < 1000 || iter > 20000000 || plainLen < 4) throw new Error('Файл повреждён');
+  const key = await deriveKey(password, head.slice(8, 24), iter);
+  const box = new Box(blob, key, head, plainLen);
+  try { await box.chunk(0); } catch (e) { throw new Error('Неверный пароль или файл повреждён'); }
+  return box;
+}
+
+async function listEntries(box) {
+  const count = new DataView((await box.read(0, 4)).buffer).getInt32(0);
+  if (count < 0) throw new Error('Файл повреждён');
+  let pos = 4;
+  const entries = [];
+  for (let i = 0; i < count; i++) {
+    const plen = new DataView((await box.read(pos, 2)).buffer).getUint16(0);
+    pos += 2;
+    const path = new TextDecoder().decode(await box.read(pos, plen));
+    pos += plen;
+    const m = new DataView((await box.read(pos, 16)).buffer);
+    pos += 16;
+    const mtime = Number(m.getBigInt64(0));
+    const size = Number(m.getBigInt64(8));
+    entries.push({ path: path, mtime: mtime, size: size, dir: size < 0, pos: pos });
+    if (size > 0) pos += size;
+  }
+  return entries;
+}
+
+async function* streamEntry(box, e, step) {
+  step = step || 4 * 1024 * 1024;
+  for (let off = 0; off < e.size; off += step) {
+    yield await box.read(e.pos + off, Math.min(step, e.size - off));
+  }
+}
+
+if (typeof module !== 'undefined') module.exports = { openBox, listEntries, streamEntry };
+
+if (typeof document !== 'undefined') {
+  const $ = (id) => document.getElementById(id);
+  let box = null, entries = [];
+
+  function setStatus(text, isErr) {
+    $('status').textContent = text;
+    $('status').className = isErr ? 'err' : '';
+  }
+  function fmtSize(n) {
+    if (n < 1024) return n + ' Б';
+    if (n < 1048576) return Math.round(n / 1024) + ' КБ';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' МБ';
+    return (n / 1073741824).toFixed(2) + ' ГБ';
+  }
+  function fmtDate(ms) {
+    const d = new Date(ms);
+    return d.toLocaleDateString('ru-RU') + ' ' + d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  }
+  const MIME = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', avif: 'image/avif', heic: 'image/heic',
+    mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska', mov: 'video/quicktime', '3gp': 'video/3gpp',
+    mp3: 'audio/mpeg', m4a: 'audio/mp4', ogg: 'audio/ogg', wav: 'audio/wav'
+  };
+  function mimeOf(path) {
+    const ext = path.split('.').pop().toLowerCase();
+    return MIME[ext] || 'application/octet-stream';
+  }
+
+  async function toBlob(e) {
+    const parts = [];
+    for await (const part of streamEntry(box, e)) parts.push(part);
+    return new Blob(parts, { type: mimeOf(e.path) });
+  }
+
+  async function download(e) {
+    const name = e.path.split('/').pop();
+    try {
+      if (window.showSaveFilePicker) {
+        const h = await window.showSaveFilePicker({ suggestedName: name });
+        const w = await h.createWritable();
+        let done = 0;
+        for await (const part of streamEntry(box, e)) {
+          await w.write(part);
+          done += part.length;
+          setStatus('Сохранение: ' + Math.round(done * 100 / Math.max(e.size, 1)) + '%');
+        }
+        await w.close();
+        setStatus('Сохранено: ' + name);
+      } else {
+        if (e.size > 1.5 * 1073741824) {
+          setStatus('Файл слишком большой для этого браузера. Откройте страницу в Chrome или Edge на компьютере.', true);
+          return;
+        }
+        setStatus('Расшифровка…');
+        const blob = await toBlob(e);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setStatus('Готово: ' + name);
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') { setStatus(''); return; }
+      setStatus('Ошибка: ' + (err.message || err), true);
+    }
+  }
+
+  async function preview(e) {
+    const mime = mimeOf(e.path);
+    if (e.size > 800 * 1048576) { setStatus('Файл слишком большой для просмотра, скачайте его.', true); return; }
+    setStatus('Расшифровка…');
+    try {
+      const blob = await toBlob(e);
+      const url = URL.createObjectURL(blob);
+      const el = mime.startsWith('image/') ? document.createElement('img')
+        : mime.startsWith('video/') ? document.createElement('video')
+        : document.createElement('audio');
+      el.src = url;
+      if (el.tagName !== 'IMG') el.controls = true;
+      $('preview').replaceChildren(el);
+      $('previewCard').hidden = false;
+      $('previewCard').scrollIntoView();
+      setStatus(e.path);
+    } catch (err) {
+      setStatus('Ошибка: ' + (err.message || err), true);
+    }
+  }
+
+  function render() {
+    const q = $('filter').value.trim().toLowerCase();
+    const rows = entries.filter((e) => !e.dir && e.path.toLowerCase().includes(q));
+    const table = $('list');
+    table.replaceChildren();
+    rows.forEach((e) => {
+      const tr = document.createElement('tr');
+      const name = document.createElement('td');
+      name.textContent = e.path;
+      const info = document.createElement('td');
+      info.className = 'num';
+      info.textContent = fmtSize(e.size) + ' · ' + fmtDate(e.mtime);
+      const act = document.createElement('td');
+      act.className = 'act';
+      const m = mimeOf(e.path);
+      if (/^(image|video|audio)\//.test(m)) {
+        const b = document.createElement('button');
+        b.className = 'small'; b.textContent = 'Смотреть';
+        b.onclick = () => preview(e);
+        act.appendChild(b);
+        act.appendChild(document.createTextNode(' '));
+      }
+      const d = document.createElement('button');
+      d.className = 'small'; d.textContent = 'Скачать';
+      d.onclick = () => download(e);
+      act.appendChild(d);
+      tr.append(name, info, act);
+      table.appendChild(tr);
+    });
+    if (!rows.length) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.textContent = 'Ничего не найдено';
+      tr.appendChild(td);
+      table.appendChild(tr);
+    }
+  }
+
+  $('filter').addEventListener('input', render);
+  $('open').addEventListener('click', async () => {
+    const f = $('file').files[0];
+    const pw = $('pw').value;
+    if (!f) { setStatus('Выберите файл контейнера', true); return; }
+    if (!pw) { setStatus('Введите пароль', true); return; }
+    $('open').disabled = true;
+    setStatus('Проверка пароля… (несколько секунд)');
+    try {
+      box = await openBox(f, pw);
+      setStatus('Чтение списка файлов…');
+      entries = await listEntries(box);
+      $('listCard').hidden = false;
+      render();
+      const n = entries.filter((e) => !e.dir).length;
+      setStatus('Файлов в контейнере: ' + n);
+    } catch (err) {
+      setStatus(err.message || String(err), true);
+    }
+    $('open').disabled = false;
+  });
+}
+</script>
+</body>
+</html>

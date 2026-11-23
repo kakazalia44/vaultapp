@@ -115,7 +115,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.coroutineContext
 import java.io.File
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -319,6 +321,8 @@ fun ExplorerScreen(
     val viewPrefs = remember { ViewPrefs(ctx) }
     var showViewDialog by remember { mutableStateOf(false) }
     var migrating by remember { mutableStateOf<String?>(null) }
+    var showExport by remember { mutableStateOf(false) }
+    var showImport by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
     val loader = remember {
@@ -490,6 +494,16 @@ fun ExplorerScreen(
                                         DropdownMenuItem(
                                             text = { Text("Обновить") },
                                             onClick = { menuOpen = false; refreshKey++ }
+                                        )
+                                    }
+                                    if (inVault) {
+                                        DropdownMenuItem(
+                                            text = { Text("Выгрузить хранилище") },
+                                            onClick = { menuOpen = false; showExport = true }
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Загрузить из контейнера") },
+                                            onClick = { menuOpen = false; showImport = true }
                                         )
                                     }
                                     DropdownMenuItem(
@@ -752,6 +766,13 @@ fun ExplorerScreen(
 
     if (showReceive) {
         ReceiveDialog(onDismiss = { showReceive = false })
+    }
+
+    if (showExport) {
+        ExportDialog(onDismiss = { showExport = false })
+    }
+    if (showImport) {
+        ImportDialog(onDismiss = { showImport = false }, onDone = { refreshKey++ })
     }
 
     val mg = migrating
@@ -1521,4 +1542,343 @@ fun MediaCollection(
             }
         }
     }
+}
+
+// ───────────────────────── Контейнер: выгрузка и загрузка ─────────────────────────
+
+@Composable
+fun PathPickerDialog(
+    title: String,
+    start: File,
+    pickFiles: Boolean,
+    onPick: (File) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val top = remember { Environment.getExternalStorageDirectory() }
+    var cur by remember { mutableStateOf(if (start.isDirectory) start else top) }
+    var refresh by remember { mutableIntStateOf(0) }
+    var newFolder by remember { mutableStateOf(false) }
+    val ctx = LocalContext.current
+
+    val items = remember(cur, refresh) {
+        (cur.listFiles()?.toList() ?: emptyList())
+            .filter { it.isDirectory || pickFiles }
+            .sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                Text(cur.path, style = MaterialTheme.typography.bodySmall)
+                if (!pickFiles) {
+                    TextButton(onClick = { newFolder = true }) { Text("＋ Новая папка") }
+                }
+                LazyColumn(Modifier.height(300.dp)) {
+                    val parent = cur.parentFile
+                    if (cur != top && parent != null) {
+                        item {
+                            TextButton(onClick = { cur = parent }, modifier = Modifier.fillMaxWidth()) {
+                                Text("⬆ Выше", modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Start)
+                            }
+                        }
+                    }
+                    items(items, key = { it.path }) { f ->
+                        TextButton(
+                            onClick = { if (f.isDirectory) cur = f else onPick(f) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                (if (f.isDirectory) "📁 " else "📄 ") + f.name,
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = TextAlign.Start,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (!pickFiles) TextButton(onClick = { onPick(cur) }) { Text("Выбрать эту папку") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
+    )
+
+    if (newFolder) {
+        NameDialog(title = "Новая папка", initial = "", onDismiss = { newFolder = false }) { name ->
+            newFolder = false
+            val d = File(cur, name)
+            when {
+                !Fs.validName(name) -> Toast.makeText(ctx, "Некорректное имя", Toast.LENGTH_SHORT).show()
+                d.exists() -> Toast.makeText(ctx, "Такое имя уже есть", Toast.LENGTH_SHORT).show()
+                d.mkdir() -> {
+                    cur = d
+                    refresh++
+                }
+                else -> Toast.makeText(ctx, "Не удалось создать папку", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+}
+
+@Composable
+fun ExportDialog(onDismiss: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val prefs = remember { ctx.getSharedPreferences("container_prefs", Context.MODE_PRIVATE) }
+    val defaultDir = remember { Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS) }
+    var folder by remember {
+        mutableStateOf(prefs.getString("folder", null)?.let { File(it) }?.takeIf { it.isDirectory } ?: defaultDir)
+    }
+    var name by remember { mutableStateOf("backup-" + SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()) + ".dat") }
+    var pw1 by remember { mutableStateOf("") }
+    var pw2 by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf<String?>(null) }
+    var pct by remember { mutableIntStateOf(-1) }
+    var working by remember { mutableStateOf(false) }
+    var job by remember { mutableStateOf<Job?>(null) }
+    var picking by remember { mutableStateOf(false) }
+
+    KeepScreenOn()
+
+    if (picking) {
+        PathPickerDialog(
+            title = "Папка для контейнера",
+            start = folder,
+            pickFiles = false,
+            onPick = {
+                folder = it
+                prefs.edit().putString("folder", it.path).apply()
+                picking = false
+            },
+            onDismiss = { picking = false }
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!working) onDismiss() },
+        title = { Text("Выгрузить хранилище") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text("Папка:", style = MaterialTheme.typography.bodySmall)
+                Text(folder.path)
+                Row {
+                    TextButton(enabled = !working, onClick = { picking = true }) { Text("Выбрать другую папку") }
+                }
+                if (folder != defaultDir) {
+                    TextButton(enabled = !working, onClick = {
+                        folder = defaultDir
+                        prefs.edit().remove("folder").apply()
+                    }) { Text("Вернуть «Загрузки»") }
+                }
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Имя файла") },
+                    singleLine = true,
+                    enabled = !working
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = pw1,
+                    onValueChange = { pw1 = it },
+                    label = { Text("Пароль (не короче 8 символов)") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    enabled = !working
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = pw2,
+                    onValueChange = { pw2 = it },
+                    label = { Text("Повторите пароль") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    enabled = !working
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Пароль восстановить нельзя. Лучше фраза из нескольких слов.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (working) {
+                    Spacer(Modifier.height(8.dp))
+                    if (pct >= 0) {
+                        LinearProgressIndicator(progress = { pct / 100f }, modifier = Modifier.fillMaxWidth())
+                    } else {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                    }
+                }
+                val st = status
+                if (st != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(st)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !working,
+                onClick = {
+                    when {
+                        !VaultCrypto.unlocked -> status = "Хранилище закрыто. Откройте его снова."
+                        !Fs.validName(name.trim()) -> status = "Некорректное имя файла"
+                        pw1.length < 8 -> status = "Пароль слишком короткий"
+                        pw1 != pw2 -> status = "Пароли не совпадают"
+                        else -> {
+                            val dest = Fs.uniqueDest(folder, name.trim())
+                            val password = pw1
+                            working = true
+                            pct = -1
+                            status = "Подготовка ключа (несколько секунд)…"
+                            job = scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        val j = coroutineContext[Job]
+                                        folder.mkdirs()
+                                        val entries = Container.collect(File(VaultCrypto.rootPath))
+                                        if (entries.none { it.file != null }) throw IOException("В хранилище нет файлов")
+                                        Container.export(entries, password, dest) { p ->
+                                            j?.ensureActive()
+                                            pct = p
+                                            status = "Запись контейнера: $p%"
+                                        }
+                                    }
+                                    status = "Готово: " + dest.path
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    status = "Ошибка: " + (e.message ?: e.javaClass.simpleName)
+                                }
+                                working = false
+                                pct = -1
+                            }
+                        }
+                    }
+                }
+            ) { Text("Создать") }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                job?.cancel()
+                onDismiss()
+            }) { Text(if (working) "Отменить" else "Закрыть") }
+        }
+    )
+}
+
+@Composable
+fun ImportDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val prefs = remember { ctx.getSharedPreferences("container_prefs", Context.MODE_PRIVATE) }
+    val defaultDir = remember { Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS) }
+    var file by remember { mutableStateOf<File?>(null) }
+    var pw by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf<String?>(null) }
+    var pct by remember { mutableIntStateOf(-1) }
+    var working by remember { mutableStateOf(false) }
+    var job by remember { mutableStateOf<Job?>(null) }
+    var picking by remember { mutableStateOf(false) }
+
+    KeepScreenOn()
+
+    if (picking) {
+        PathPickerDialog(
+            title = "Выберите файл контейнера",
+            start = prefs.getString("folder", null)?.let { File(it) }?.takeIf { it.isDirectory } ?: defaultDir,
+            pickFiles = true,
+            onPick = {
+                file = it
+                picking = false
+            },
+            onDismiss = { picking = false }
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!working) onDismiss() },
+        title = { Text("Загрузить из контейнера") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text(
+                    "Файлы будут добавлены в хранилище. Если такое имя уже есть, к новому файлу добавится номер.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(file?.path ?: "Файл не выбран")
+                TextButton(enabled = !working, onClick = { picking = true }) { Text("Выбрать файл") }
+                OutlinedTextField(
+                    value = pw,
+                    onValueChange = { pw = it },
+                    label = { Text("Пароль контейнера") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    enabled = !working
+                )
+                if (working) {
+                    Spacer(Modifier.height(8.dp))
+                    if (pct >= 0) {
+                        LinearProgressIndicator(progress = { pct / 100f }, modifier = Modifier.fillMaxWidth())
+                    } else {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                    }
+                }
+                val st = status
+                if (st != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(st)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !working,
+                onClick = {
+                    val src = file
+                    when {
+                        !VaultCrypto.unlocked -> status = "Хранилище закрыто. Откройте его снова."
+                        src == null -> status = "Выберите файл контейнера"
+                        pw.isEmpty() -> status = "Введите пароль"
+                        else -> {
+                            val password = pw
+                            working = true
+                            pct = -1
+                            status = "Проверка пароля (несколько секунд)…"
+                            job = scope.launch {
+                                try {
+                                    val n = withContext(Dispatchers.IO) {
+                                        val j = coroutineContext[Job]
+                                        Container.import(src, password, File(VaultCrypto.rootPath), true) { p ->
+                                            j?.ensureActive()
+                                            pct = p
+                                            status = "Загрузка: $p%"
+                                        }
+                                    }
+                                    status = "Готово: загружено файлов $n"
+                                    onDone()
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    status = "Ошибка: " + (e.message ?: e.javaClass.simpleName)
+                                    onDone()
+                                }
+                                working = false
+                                pct = -1
+                            }
+                        }
+                    }
+                }
+            ) { Text("Загрузить") }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                job?.cancel()
+                onDismiss()
+            }) { Text(if (working) "Отменить" else "Закрыть") }
+        }
+    )
 }
